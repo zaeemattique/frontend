@@ -1,0 +1,593 @@
+/**
+ * Add New Template Page
+ *
+ * Full template creation form with:
+ * - Template Name & Description
+ * - Three prompt fields (Default/SOW, Architecture, Pricing)
+ * - Template Variables builder
+ * - File upload (.docx)
+ */
+
+'use client';
+
+import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { ArrowLeft, Plus, X, Loader2, Upload, FileText } from 'lucide-react';
+import { Button } from '@/components/ui/Button';
+import { FileDropzone } from '@/components/ui/FileDropzone';
+import { Select } from '@/components/ui/Select';
+import { useCreateDocumentTemplateMutation, useUpdateDocumentTemplateMutation, useGetDocumentUploadUrlMutation } from '@/store/services/api';
+// Local form variable type (allows partial values during editing)
+interface FormVariable {
+  name: string;
+  type: 'string' | 'bulleted_list' | 'heading_paragraphs' | 'object' | 'currency' | 'date' | 'number';
+  description: string;
+  schema?: Record<string, string>;
+}
+
+interface FormData {
+  name: string;
+  description: string;
+  defaultPrompt: string;
+  implementationPrompt: string;
+  architecturePrompt: string;
+  essentialPricingPrompt: string;
+  growthPricingPrompt: string;
+  templateVariables: FormVariable[];
+}
+
+const VARIABLE_TYPES = [
+  { value: 'string', label: 'String' },
+  { value: 'bulleted_list', label: 'Bulleted List' },
+  { value: 'heading_paragraphs', label: 'Heading Paragraphs' },
+  { value: 'object', label: 'Object' },
+  { value: 'currency', label: 'Currency' },
+  { value: 'date', label: 'Date' },
+  { value: 'number', label: 'Number' },
+] as const;
+
+export default function AddTemplatePage() {
+  const router = useRouter();
+  const [createTemplate] = useCreateDocumentTemplateMutation();
+  const [updateTemplate] = useUpdateDocumentTemplateMutation();
+  const [getUploadUrl] = useGetDocumentUploadUrlMutation();
+
+  const [formData, setFormData] = useState<FormData>({
+    name: '',
+    description: '',
+    defaultPrompt: '',
+    implementationPrompt: '',
+    architecturePrompt: '',
+    essentialPricingPrompt: '',
+    growthPricingPrompt: '',
+    templateVariables: [],
+  });
+
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+
+  useEffect(() => {
+    document.title = 'New Template - SOW Generator';
+    return () => {
+      document.title = 'SOW Generator';
+    };
+  }, []);
+
+  // Template Variables Management
+  const addVariable = () => {
+    setFormData({
+      ...formData,
+      templateVariables: [
+        ...formData.templateVariables,
+        { name: '', type: 'string', description: '' },
+      ],
+    });
+  };
+
+  const updateVariable = (index: number, field: keyof FormVariable, value: string) => {
+    const updated = formData.templateVariables.map((v, i) => {
+      if (i !== index) return v;
+      return { ...v, [field]: value } as FormVariable;
+    });
+    setFormData({ ...formData, templateVariables: updated });
+  };
+
+  const removeVariable = (index: number) => {
+    const updated = formData.templateVariables.filter((_, i) => i !== index);
+    setFormData({ ...formData, templateVariables: updated });
+  };
+
+  // File handling
+  const handleFilesSelected = (files: File[]) => {
+    const file = files[0];
+    if (file) {
+      setSelectedFile(file);
+      setError(null);
+    }
+  };
+
+  // Upload file to S3 - returns both filename and s3Key
+  const uploadFileToS3 = async (file: File, templateId: string): Promise<{ filename: string; s3Key: string } | null> => {
+    setUploading(true);
+    setUploadProgress(0);
+
+    try {
+      const cleanFilename = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
+
+      // Get presigned URL (also returns s3Key for where file will be stored)
+      const uploadUrlResult = await getUploadUrl({
+        id: templateId,
+        filename: cleanFilename,
+        contentType: file.type || 'application/octet-stream',
+      }).unwrap();
+
+      // Upload to S3 with progress tracking
+      await new Promise<void>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+
+        xhr.upload.addEventListener('progress', (event) => {
+          if (event.lengthComputable) {
+            const percentage = Math.round((event.loaded / event.total) * 100);
+            setUploadProgress(percentage);
+          }
+        });
+
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve();
+          } else {
+            reject(new Error(`Upload failed with status ${xhr.status}`));
+          }
+        });
+
+        xhr.addEventListener('error', () => reject(new Error('Upload failed')));
+        xhr.addEventListener('abort', () => reject(new Error('Upload aborted')));
+
+        xhr.open('PUT', uploadUrlResult.uploadUrl);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.send(file);
+      });
+
+      // Return both filename and s3Key - s3Key is needed by SOW generator to find the file
+      return { filename: cleanFilename, s3Key: uploadUrlResult.s3Key };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'File upload failed';
+      setError(message);
+      return null;
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // Form validation
+  const validateForm = (): string | null => {
+    if (!formData.name.trim()) {
+      return 'Template name is required';
+    }
+    if (!formData.description.trim()) {
+      return 'Description is required';
+    }
+    if (!formData.defaultPrompt.trim()) {
+      return 'Default prompt (SOW Generation) is required';
+    }
+    if (!formData.implementationPrompt.trim()) {
+      return 'Implementation prompt is required';
+    }
+    if (!formData.architecturePrompt.trim()) {
+      return 'Architecture prompt is required';
+    }
+    // SMC prompts are optional - system defaults will be used if empty
+    if (formData.templateVariables.length === 0) {
+      return 'At least one template variable is required';
+    }
+
+    for (let i = 0; i < formData.templateVariables.length; i++) {
+      const variable = formData.templateVariables[i];
+      if (!variable) continue;
+      if (!variable.name.trim()) {
+        return `Variable #${i + 1}: Name is required`;
+      }
+      if (!variable.description.trim()) {
+        return `Variable #${i + 1}: Description is required`;
+      }
+    }
+
+    return null;
+  };
+
+  // Save template
+  const handleSave = async () => {
+    const validationError = validateForm();
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+
+    try {
+      // Step 1: Create template record
+      const templateData = {
+        name: formData.name.trim(),
+        description: formData.description.trim(),
+        type: 'SOW_TEMPLATE' as const,
+        defaultPrompt: formData.defaultPrompt.trim(),
+        implementationPrompt: formData.implementationPrompt.trim(),
+        architecturePrompt: formData.architecturePrompt.trim(),
+        essentialPricingPrompt: formData.essentialPricingPrompt.trim(),
+        growthPricingPrompt: formData.growthPricingPrompt.trim(),
+        templateVariables: formData.templateVariables,
+      };
+
+      const createResult = await createTemplate(templateData).unwrap();
+
+      if (!createResult.id) {
+        throw new Error('Template created but no ID returned');
+      }
+
+      // Step 2: Upload file if selected
+      if (selectedFile) {
+        const uploadResult = await uploadFileToS3(selectedFile, createResult.id);
+        if (uploadResult) {
+          // Update template with filename AND s3Key (s3Key is critical for SOW generator to find the file)
+          const updatePayload = {
+            name: formData.name.trim(),
+            templateFilename: uploadResult.filename,
+            s3Key: uploadResult.s3Key, // This is the actual S3 path: sow-templates/{id}/{filename}
+          };
+          console.log('[AddTemplate] Updating template with payload:', updatePayload);
+          await updateTemplate({
+            id: createResult.id,
+            template: updatePayload,
+          }).unwrap();
+        }
+      }
+
+      // Navigate back to templates list
+      router.push('/templates');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to create template';
+      setError(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCancel = () => {
+    router.push('/templates');
+  };
+
+  return (
+    <div className="h-full flex flex-col p-6 overflow-y-auto">
+      {/* Header */}
+      <div className="mb-6">
+        <button
+          onClick={handleCancel}
+          className="flex items-center text-sm text-gray-600 hover:text-gray-900 mb-4"
+        >
+          <ArrowLeft className="w-4 h-4 mr-1" />
+          Back to Templates
+        </button>
+        <h1 className="text-2xl font-semibold text-gray-900">New Document Template</h1>
+        <p className="text-sm text-gray-600 mt-1">
+          Configure your document template for SOW generation
+        </p>
+      </div>
+
+      {/* Form */}
+      <div className="bg-white rounded-lg border border-gray-200 p-6 max-w-4xl">
+        {/* Error Message */}
+        {error && (
+          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-600">
+            {error}
+          </div>
+        )}
+
+        {/* Template Name */}
+        <div className="mb-6">
+          <label htmlFor="name" className="block text-sm font-medium text-gray-700 mb-1">
+            Name <span className="text-red-500">*</span>
+          </label>
+          <input
+            type="text"
+            id="name"
+            value={formData.name}
+            onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
+            placeholder="e.g., Standard SOW Template"
+          />
+        </div>
+
+        {/* Description */}
+        <div className="mb-6">
+          <label htmlFor="description" className="block text-sm font-medium text-gray-700 mb-1">
+            Description <span className="text-red-500">*</span>
+          </label>
+          <textarea
+            id="description"
+            value={formData.description}
+            onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+            rows={3}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y"
+            placeholder="Describe the purpose and use case for this template"
+          />
+        </div>
+
+        {/* Default Prompt */}
+        <div className="mb-6">
+          <label htmlFor="defaultPrompt" className="block text-sm font-medium text-gray-700 mb-1">
+            Default Prompt (SOW Generation) <span className="text-red-500">*</span>
+          </label>
+          <textarea
+            id="defaultPrompt"
+            value={formData.defaultPrompt}
+            onChange={(e) => setFormData({ ...formData, defaultPrompt: e.target.value })}
+            rows={6}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y font-mono text-sm"
+            placeholder="Enter the prompt that will be used to generate SOW content for this template"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Define the business context and sections. Do not include JSON schema or formatting instructions.
+          </p>
+        </div>
+
+        {/* Implementation Prompt */}
+        <div className="mb-6">
+          <label htmlFor="implementationPrompt" className="block text-sm font-medium text-gray-700 mb-1">
+            Implementation Plan Prompt <span className="text-red-500">*</span>
+          </label>
+          <textarea
+            id="implementationPrompt"
+            value={formData.implementationPrompt}
+            onChange={(e) => setFormData({ ...formData, implementationPrompt: e.target.value })}
+            rows={6}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y font-mono text-sm"
+            placeholder="Enter the prompt for generating implementation plan documents (phases, milestones, delivery approach)"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Available placeholders: {'{customer}'}, {'{project}'}, {'{facts_pack}'}
+          </p>
+        </div>
+
+        {/* Architecture Prompt */}
+        <div className="mb-6">
+          <label htmlFor="architecturePrompt" className="block text-sm font-medium text-gray-700 mb-1">
+            Architecture / Services Prompt <span className="text-red-500">*</span>
+          </label>
+          <textarea
+            id="architecturePrompt"
+            value={formData.architecturePrompt}
+            onChange={(e) => setFormData({ ...formData, architecturePrompt: e.target.value })}
+            rows={6}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y font-mono text-sm"
+            placeholder="Enter the prompt for generating AWS services technical specification documents"
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Available placeholders: {'{customer}'}, {'{project}'}, {'{facts_pack}'}
+          </p>
+        </div>
+
+        {/* Essential SMC Prompt */}
+        <div className="mb-6">
+          <label htmlFor="essentialPricingPrompt" className="block text-sm font-medium text-gray-700 mb-1">
+            Essential SMC Prompt
+            <span className="ml-2 text-xs font-normal text-gray-500">
+              (Baseline AWS spend - minimal configuration)
+            </span>
+          </label>
+          <textarea
+            id="essentialPricingPrompt"
+            value={formData.essentialPricingPrompt}
+            onChange={(e) => setFormData({ ...formData, essentialPricingPrompt: e.target.value })}
+            rows={6}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y font-mono text-sm"
+            placeholder="Leave empty to use system default. Custom prompt for Essential SMC (baseline cost estimate)..."
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Essential SMC: single-AZ, no DR, On-Demand pricing only. Placeholders: {'{customer}'}, {'{project}'}, {'{facts_pack}'}, {'{architecture_content}'}, {'{capacity_section}'}
+          </p>
+        </div>
+
+        {/* Growth SMC Prompt */}
+        <div className="mb-6">
+          <label htmlFor="growthPricingPrompt" className="block text-sm font-medium text-gray-700 mb-1">
+            Growth SMC Prompt
+            <span className="ml-2 text-xs font-normal text-gray-500">
+              (Scale-ready with HA/DR for AWS funding)
+            </span>
+          </label>
+          <textarea
+            id="growthPricingPrompt"
+            value={formData.growthPricingPrompt}
+            onChange={(e) => setFormData({ ...formData, growthPricingPrompt: e.target.value })}
+            rows={6}
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent resize-y font-mono text-sm"
+            placeholder="Leave empty to use system default. Custom prompt for Growth SMC (scaled cost estimate)..."
+          />
+          <p className="text-xs text-gray-500 mt-1">
+            Growth SMC: Multi-AZ, DR, 10-20% buffer, RI recommendations. Placeholders: {'{customer}'}, {'{project}'}, {'{facts_pack}'}, {'{architecture_content}'}, {'{capacity_section}'}
+          </p>
+        </div>
+
+        {/* Template Variables Section */}
+        <div className="mb-6">
+          <div className="flex items-center justify-between mb-1">
+            <label className="block text-sm font-medium text-gray-700">
+              Template Variables <span className="text-red-500">*</span>
+            </label>
+          </div>
+          <p className="text-xs text-gray-500 mb-4">
+            Define the variables used in your Word template (e.g., {'{{executive_summary}}'}, {'{{in_scope}}'})
+          </p>
+
+          {formData.templateVariables.length > 0 && (
+            <>
+              {/* Column Headers */}
+              <div className="flex gap-4 items-end mb-2">
+                <div className="flex-1">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Variable Name
+                  </label>
+                </div>
+                <div className="w-40">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Type
+                  </label>
+                </div>
+                <div className="flex-[2]">
+                  <label className="block text-sm font-medium text-gray-700">
+                    Description
+                  </label>
+                </div>
+                <div className="w-10" /> {/* Spacer for delete button */}
+              </div>
+
+              {/* Variable Rows */}
+              <div className="space-y-3">
+                {formData.templateVariables.map((variable, index) => (
+                  <div key={index} className="flex gap-4 items-center">
+                    {/* Variable Name */}
+                    <div className="flex-1">
+                      <input
+                        type="text"
+                        value={variable.name}
+                        onChange={(e) => updateVariable(index, 'name', e.target.value)}
+                        className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
+                        placeholder="e.g., executive_summary"
+                      />
+                    </div>
+
+                    {/* Variable Type */}
+                    <div className="w-40">
+                      <Select
+                        options={VARIABLE_TYPES.map(t => ({ value: t.value, label: t.label }))}
+                        value={variable.type}
+                        onChange={(value) => updateVariable(index, 'type', value)}
+                      />
+                    </div>
+
+                    {/* Variable Description */}
+                    <div className="flex-[2]">
+                      <input
+                        type="text"
+                        value={variable.description}
+                        onChange={(e) => updateVariable(index, 'description', e.target.value)}
+                        className="w-full px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent"
+                        placeholder="e.g., project overview paragraph"
+                      />
+                    </div>
+
+                    {/* Remove Button */}
+                    <button
+                      type="button"
+                      onClick={() => removeVariable(index)}
+                      className="w-10 h-10 flex items-center justify-center bg-violet-900 text-white rounded-lg hover:bg-violet-800 transition-colors"
+                      title="Remove variable"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {formData.templateVariables.length === 0 && (
+            <div className="text-center py-8 text-sm text-gray-500 border border-dashed border-gray-300 rounded-lg">
+              No variables defined. Click &quot;Add Variable&quot; to create your first template variable.
+            </div>
+          )}
+
+          {/* Add Variable Button */}
+          <div className="mt-4">
+            <Button variant="secondary" onClick={addVariable} className="text-sm">
+              <Plus className="w-4 h-4 mr-1" />
+              Add Variable
+            </Button>
+          </div>
+        </div>
+
+        {/* Template File Upload */}
+        <div className="mb-6">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Template File (.docx)
+          </label>
+
+          {selectedFile ? (
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <FileText className="w-8 h-8 text-violet-600" />
+                  <div>
+                    <p className="text-sm font-medium text-gray-900">{selectedFile.name}</p>
+                    <p className="text-xs text-gray-500">
+                      {(selectedFile.size / 1024).toFixed(1)} KB
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedFile(null)}
+                  className="text-gray-400 hover:text-red-500 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {uploading && (
+                <div className="mt-3">
+                  <div className="w-full bg-gray-200 rounded-full h-1.5">
+                    <div
+                      className="bg-green-500 h-1.5 rounded-full transition-all duration-300"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-gray-500 mt-1">{uploadProgress}% uploaded</p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <FileDropzone
+              onFilesSelected={handleFilesSelected}
+              accept=".doc,.docx"
+              title="Drop your template file here or click to browse"
+              subtitle="Word documents only (.doc, .docx)"
+              maxSizeLabel="Max size 10MB"
+            />
+          )}
+          <p className="text-xs text-gray-500 mt-2">
+            Note: You can save the template without a file and upload it later.
+          </p>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex items-center gap-3 pt-6 border-t border-gray-200">
+          <Button variant="secondary" onClick={handleCancel} disabled={saving || uploading}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={handleSave}
+            disabled={saving || uploading}
+          >
+            {saving ? (
+              <>
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                {uploading ? 'Uploading...' : 'Creating...'}
+              </>
+            ) : (
+              <>
+                <Upload className="w-4 h-4 mr-2" />
+                Create Template
+              </>
+            )}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
