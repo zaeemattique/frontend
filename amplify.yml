@@ -1,0 +1,19 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - cd oscar-prod/App/frontend-nextjs
+        - yarn install --frozen-lockfile
+    build:
+      commands:
+        - cd oscar-prod/App/frontend-nextjs
+        - yarn run build
+  artifacts:
+    baseDirectory: oscar-prod/App/frontend-nextjs/.next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*
